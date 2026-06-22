@@ -1,0 +1,205 @@
+"""
+SentinelAI Log Parser
+Parses Linux /var/log/auth.log (and similar) into structured events.
+
+Supports standard syslog format used by sshd, sudo, su, PAM, etc:
+  Mon DD HH:MM:SS hostname process[pid]: message
+
+Example lines handled:
+  Jun 13 09:14:02 prod-web01 sshd[14213]: Failed password for root from 203.0.113.55 port 51422 ssh2
+  Jun 13 09:14:05 prod-web01 sshd[14213]: Failed password for invalid user admin from 203.0.113.55 port 51430 ssh2
+  Jun 13 09:15:10 prod-web01 sshd[14290]: Accepted password for deploy from 10.0.0.12 port 22150 ssh2
+  Jun 13 09:20:00 prod-web01 sudo: amanX : TTY=pts/0 ; PWD=/home/amanX ; USER=root ; COMMAND=/bin/cat /etc/shadow
+"""
+
+import re
+from datetime import datetime
+from typing import List, Dict, Optional
+from dataclasses import dataclass, field
+
+
+# ─── Regex patterns for known log line types ──────────────────────────
+
+SYSLOG_PREFIX = re.compile(
+    r'^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+'
+    r'(?P<host>\S+)\s+(?P<process>[\w\-/.]+)(\[(?P<pid>\d+)\])?:\s*(?P<message>.*)$'
+)
+
+FAILED_PASSWORD = re.compile(
+    r'Failed password for (invalid user )?(?P<user>\S+) from (?P<ip>[\d.:a-fA-F]+) port (?P<port>\d+)'
+)
+
+ACCEPTED_PASSWORD = re.compile(
+    r'Accepted (?P<method>password|publickey) for (?P<user>\S+) from (?P<ip>[\d.:a-fA-F]+) port (?P<port>\d+)'
+)
+
+INVALID_USER = re.compile(
+    r'Invalid user (?P<user>\S+) from (?P<ip>[\d.:a-fA-F]+)'
+)
+
+SUDO_COMMAND = re.compile(
+    r'(?P<sudo_user>\S+)\s*:\s*TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target_user>\S+)\s*;\s*COMMAND=(?P<command>.*)$'
+)
+
+SESSION_OPENED = re.compile(r'session opened for user (?P<user>\S+)')
+SESSION_CLOSED = re.compile(r'session closed for user (?P<user>\S+)')
+
+DISCONNECT = re.compile(
+    r'Disconnect(ed|ing)? from (invalid user )?(?P<user>\S+ )?(?P<ip>[\d.:a-fA-F]+) port (?P<port>\d+)'
+)
+
+MONTH_MAP = {
+    'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+    'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+}
+
+
+@dataclass
+class AuthEvent:
+    """Structured representation of a single auth log event."""
+    raw_line: str
+    timestamp: Optional[datetime]
+    host: str
+    process: str
+    pid: Optional[int]
+    event_type: str          # failed_login, accepted_login, invalid_user, sudo_command, session_open, session_close, disconnect, other
+    user: Optional[str] = None
+    source_ip: Optional[str] = None
+    port: Optional[int] = None
+    command: Optional[str] = None
+    target_user: Optional[str] = None
+    auth_method: Optional[str] = None
+    message: str = ""
+
+    def to_dict(self) -> Dict:
+        return {
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'host': self.host,
+            'process': self.process,
+            'pid': self.pid,
+            'event_type': self.event_type,
+            'user': self.user,
+            'source_ip': self.source_ip,
+            'port': self.port,
+            'command': self.command,
+            'target_user': self.target_user,
+            'auth_method': self.auth_method,
+            'message': self.message,
+        }
+
+
+class AuthLogParser:
+    """Parses raw auth.log content into structured AuthEvent objects."""
+
+    def __init__(self, default_year: Optional[int] = None):
+        self.default_year = default_year or datetime.now().year
+
+    def _parse_timestamp(self, month: str, day: str, time_str: str) -> Optional[datetime]:
+        try:
+            month_num = MONTH_MAP.get(month, 1)
+            h, m, s = map(int, time_str.split(':'))
+            return datetime(self.default_year, month_num, int(day), h, m, s)
+        except (ValueError, KeyError):
+            return None
+
+    def parse_line(self, line: str) -> Optional[AuthEvent]:
+        """Parse a single log line into an AuthEvent. Returns None if unparseable."""
+        line = line.rstrip('\n')
+        if not line.strip():
+            return None
+
+        m = SYSLOG_PREFIX.match(line)
+        if not m:
+            return None
+
+        gd = m.groupdict()
+        timestamp = self._parse_timestamp(gd['month'], gd['day'], gd['time'])
+        host = gd['host']
+        process = gd['process']
+        pid = int(gd['pid']) if gd['pid'] else None
+        message = gd['message']
+
+        event = AuthEvent(
+            raw_line=line,
+            timestamp=timestamp,
+            host=host,
+            process=process,
+            pid=pid,
+            event_type='other',
+            message=message
+        )
+
+        # Try each pattern in order of specificity
+        fp = FAILED_PASSWORD.search(message)
+        if fp:
+            event.event_type = 'failed_login'
+            event.user = fp.group('user')
+            event.source_ip = fp.group('ip')
+            event.port = int(fp.group('port'))
+            return event
+
+        ap = ACCEPTED_PASSWORD.search(message)
+        if ap:
+            event.event_type = 'accepted_login'
+            event.user = ap.group('user')
+            event.source_ip = ap.group('ip')
+            event.port = int(ap.group('port'))
+            event.auth_method = ap.group('method')
+            return event
+
+        iu = INVALID_USER.search(message)
+        if iu:
+            event.event_type = 'invalid_user'
+            event.user = iu.group('user')
+            event.source_ip = iu.group('ip')
+            return event
+
+        sc = SUDO_COMMAND.search(message)
+        if sc and process == 'sudo':
+            event.event_type = 'sudo_command'
+            event.user = sc.group('sudo_user')
+            event.target_user = sc.group('target_user')
+            event.command = sc.group('command')
+            return event
+
+        so = SESSION_OPENED.search(message)
+        if so:
+            event.event_type = 'session_open'
+            event.user = so.group('user')
+            return event
+
+        sc2 = SESSION_CLOSED.search(message)
+        if sc2:
+            event.event_type = 'session_close'
+            event.user = sc2.group('user')
+            return event
+
+        dc = DISCONNECT.search(message)
+        if dc:
+            event.event_type = 'disconnect'
+            event.source_ip = dc.group('ip')
+            event.port = int(dc.group('port')) if dc.group('port') else None
+            if dc.group('user'):
+                event.user = dc.group('user').strip()
+            return event
+
+        return event  # type 'other' — still useful context
+
+    def parse_file(self, filepath: str) -> List[AuthEvent]:
+        """Parse an entire auth.log file."""
+        events = []
+        with open(filepath, 'r', errors='replace') as f:
+            for line in f:
+                evt = self.parse_line(line)
+                if evt:
+                    events.append(evt)
+        return events
+
+    def parse_text(self, text: str) -> List[AuthEvent]:
+        """Parse raw log text (e.g. from upload/paste) into events."""
+        events = []
+        for line in text.splitlines():
+            evt = self.parse_line(line)
+            if evt:
+                events.append(evt)
+        return events
