@@ -1,0 +1,235 @@
+# 🔍 HOW_IT_WORKS.md — SentinelAI Deep Dive
+
+> A complete explanation of how SentinelAI detects and explains threats — from raw log line to plain-English report.
+
+---
+
+## 🎯 The Problem SentinelAI Solves
+
+Manually reading `/var/log/auth.log` doesn't scale. A busy server generates thousands of lines per day. Traditional approaches fail:
+
+| Traditional Method | Problem |
+|---|---|
+| `grep "Failed password"` | No context on rate, pattern, or severity — just a flat list |
+| Fixed threshold alerts (e.g. "alert after 5 failures") | Easy to evade by spacing attempts out; doesn't catch enumeration or privilege escalation |
+| Manual review | Doesn't scale, misses subtle multi-signal patterns |
+| Signature-based IDS | Only catches *known* attack signatures — misses novel patterns |
+
+**SentinelAI's approach:** learn what "normal" looks like for *this specific log*, using unsupervised ML — then flag statistical outliers across multiple behavioral dimensions simultaneously, and explain *why* in plain English.
+
+---
+
+## 🔄 Complete Pipeline Flow
+
+```
+═══════════════════════════════════════════════════════════
+STAGE 1: PARSING
+═══════════════════════════════════════════════════════════
+
+Raw log line:
+"Jun 13 09:14:02 prod-web01 sshd[14213]: Failed password for
+ root from 203.0.113.55 port 51422 ssh2"
+
+         │  regex match against known patterns
+         ▼
+AuthEvent(
+  timestamp=2026-06-13 09:14:02,
+  event_type='failed_login',
+  user='root',
+  source_ip='203.0.113.55',
+  port=51422
+)
+
+═══════════════════════════════════════════════════════════
+STAGE 2: FEATURE ENGINEERING
+═══════════════════════════════════════════════════════════
+
+All events from 203.0.113.55 between 09:10-09:20
+         │  group + aggregate
+         ▼
+{
+  source_ip: '203.0.113.55',
+  window_start: '09:10',
+  failed_login_count: 9,
+  invalid_user_count: 6,
+  distinct_usernames_tried: 7,
+  events_per_minute: 16.0,
+  night_time_activity: 0.0,
+  ... (11 features total)
+}
+
+═══════════════════════════════════════════════════════════
+STAGE 3: ML ANOMALY DETECTION
+═══════════════════════════════════════════════════════════
+
+All behavioral windows from this log
+         │  StandardScaler normalize
+         ▼
+         │  Isolation Forest (200 trees, contamination=0.1)
+         ▼
+risk_score = 100   ← this window is far outside normal range
+is_anomaly = True
+
+═══════════════════════════════════════════════════════════
+STAGE 4: LLM NARRATION
+═══════════════════════════════════════════════════════════
+
+Structured finding + feature breakdown
+         │  prompt → Claude (or offline template)
+         ▼
+"SUMMARY: Source 203.0.113.55 triggered a risk score of
+ 100/100 with 9 failed logins, 6 invalid-user attempts...
+ LIKELY ATTACK PATTERN: Account enumeration / credential stuffing
+ RECOMMENDED ACTION: Rate-limit or block 203.0.113.55..."
+```
+
+---
+
+## 🌳 Isolation Forest — How It Actually Works
+
+Unlike most ML algorithms that model what's *normal*, Isolation Forest directly models what's *easy to isolate* — and anomalies are, by definition, easy to isolate.
+
+```
+Step 1: Build many random binary trees
+  Each tree randomly picks a feature and a split value,
+  recursively partitioning the data.
+
+Step 2: Measure path length
+  For each data point, count how many splits it takes
+  to isolate it into its own leaf node.
+
+Step 3: Anomalies isolate FAST
+  Normal points: deep in the tree (many splits needed —
+                  they're surrounded by similar points)
+  Anomalies:     shallow in the tree (few splits needed —
+                  they're "alone" in feature space)
+
+Step 4: Average across all trees → anomaly score
+  Shorter average path length = more anomalous
+
+Visualization (2 features: failed_logins vs distinct_users):
+
+  distinct_users
+       │
+    10 │                              ★ 203.0.113.55
+       │                                (isolated FAST —
+     5 │   ●●●●●                         anomaly!)
+       │   ●●●●●●●
+     1 │  ●●●●●●●●●●  ← dense cluster of normal logins
+       │  (isolated SLOW — many splits needed)
+       └──────────────────────────────► failed_logins
+           1    5    10    15
+```
+
+This is why Isolation Forest needs **no labeled attack examples** — it only needs to know what the bulk of "normal" traffic looks like, and anomalies stand out geometrically.
+
+---
+
+## 📊 The 11 Behavioral Features
+
+| # | Feature | Why it matters |
+|---|---|---|
+| 1 | `failed_login_count` | Core brute-force signal |
+| 2 | `accepted_login_count` | Baseline for failure ratio |
+| 3 | `invalid_user_count` | Enumeration signal — trying usernames that don't exist |
+| 4 | `distinct_usernames_tried` | Spray attacks try many usernames; brute force tries few |
+| 5 | `sudo_command_count` | Privilege escalation activity volume |
+| 6 | `distinct_target_users` | Lateral movement / multiple privilege targets |
+| 7 | `failure_to_success_ratio` | Normalizes failure volume against context |
+| 8 | `time_span_seconds` | How tightly clustered the activity is |
+| 9 | `events_per_minute` | Automated/scripted attacks are fast; humans are slow |
+| 10 | `night_time_activity` | Off-hours access can indicate compromised credentials |
+| 11 | `unique_ports_used` | Many distinct source ports can indicate connection churn from automated tooling |
+
+These features are computed **per source IP, per 10-minute window** — because attacks are *behavioral patterns over time*, not single suspicious lines.
+
+---
+
+## 🧠 Why the LLM Doesn't Make Detection Decisions
+
+A common mistake in "AI security tools" is asking an LLM to directly judge "is this log suspicious?" This is risky because:
+
+- LLMs can be inconsistent across runs
+- LLMs have no ground truth about *your* environment's normal baseline
+- LLM judgment isn't easily auditable or reproducible
+
+**SentinelAI's design avoids this entirely:**
+
+```
+┌─────────────────────┐         ┌──────────────────────┐
+│   Isolation Forest   │         │     Claude LLM        │
+│   (decides WHAT)     │   ──►   │   (explains WHY)      │
+│                      │         │                       │
+│  Deterministic        │         │  Natural language      │
+│  Reproducible          │         │  Context-aware         │
+│  Auditable             │         │  Human-readable        │
+└─────────────────────┘         └──────────────────────┘
+```
+
+The LLM receives **already-computed, already-flagged** numeric findings and only translates them into prose. If the LLM is unavailable (no API key, no internet), the offline rule-based template engine produces equivalent — if less nuanced — explanations using the same underlying logic patterns (brute force, enumeration, privilege escalation, etc.).
+
+---
+
+## 🔁 Time Windowing Explained
+
+```
+Why 10-minute windows by default?
+
+Too short (1 min):
+  Risk: splits a single attack across many windows,
+        diluting the signal in each one
+
+Too long (60 min):
+  Risk: blends an attack together with unrelated normal
+        traffic from the same IP, diluting the anomaly
+
+10 minutes:
+  Sweet spot for most brute-force/enumeration attacks,
+  which typically execute in tight bursts (seconds to
+  a few minutes). Adjustable via --window flag.
+```
+
+---
+
+## 📤 Output Modes
+
+```
+Terminal report  → Human-readable, color-free, pipeable
+--json report.json → Structured export for SIEM ingestion,
+                      dashboards, or further automated processing
+```
+
+Example JSON structure:
+```json
+{
+  "summary": {
+    "total_events_parsed": 63,
+    "total_windows": 18,
+    "anomalous_windows": 4,
+    "contamination_setting": 0.1,
+    "llm_narration_used": false
+  },
+  "windows": [
+    {
+      "source_ip": "203.0.113.55",
+      "window_start": "2026-06-13T09:10:00",
+      "risk_score": 100.0,
+      "is_anomaly": true,
+      "failed_login_count": 9,
+      ...
+    }
+  ]
+}
+```
+
+---
+
+## ⚙️ Tuning Guide
+
+| Parameter | Increase if... | Decrease if... |
+|---|---|---|
+| `--contamination` | Too many real attacks are being missed | Too many false positives flagged |
+| `--window` | Attacks span longer time periods in your environment | Attacks are fast bursts getting diluted |
+| `--top` | You want a broader review list | You only want the most critical findings |
+
+A good starting point for most servers: `--contamination 0.1 --window 10` (the defaults).
