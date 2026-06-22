@@ -1,0 +1,115 @@
+"""
+SentinelAI Feature Engineering
+Converts parsed AuthEvents into numerical feature vectors for the
+Isolation Forest anomaly detection model.
+
+Features are computed per source IP, per time-window, because attacks
+(brute force, credential stuffing, enumeration) manifest as abnormal
+BEHAVIOR over time, not single abnormal events.
+"""
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import List, Dict
+import pandas as pd
+import numpy as np
+
+from log_parser import AuthEvent
+
+
+class FeatureBuilder:
+    """
+    Builds per-IP behavioral feature vectors from a list of AuthEvents,
+    bucketed into fixed time windows (default: 10 minutes).
+    """
+
+    FEATURE_NAMES = [
+        'failed_login_count',
+        'accepted_login_count',
+        'invalid_user_count',
+        'distinct_usernames_tried',
+        'sudo_command_count',
+        'distinct_target_users',
+        'failure_to_success_ratio',
+        'time_span_seconds',
+        'events_per_minute',
+        'night_time_activity',     # fraction of events between 00:00-06:00
+        'unique_ports_used',
+    ]
+
+    def __init__(self, window_minutes: int = 10):
+        self.window_minutes = window_minutes
+
+    def _window_key(self, ts: datetime) -> datetime:
+        """Floor a timestamp to the start of its time window."""
+        minutes = (ts.minute // self.window_minutes) * self.window_minutes
+        return ts.replace(minute=minutes, second=0, microsecond=0)
+
+    def build(self, events: List[AuthEvent]) -> pd.DataFrame:
+        """
+        Group events by (source_ip, time_window) and compute features.
+        Returns a DataFrame: one row per (ip, window) group.
+        """
+        groups = defaultdict(list)
+
+        for evt in events:
+            if not evt.timestamp:
+                continue
+            # Group auth-relevant events by IP; sudo events by user as pseudo-ip
+            key_ip = evt.source_ip or f"local:{evt.user or 'unknown'}"
+            window = self._window_key(evt.timestamp)
+            groups[(key_ip, window)].append(evt)
+
+        rows = []
+        for (ip, window), group_events in groups.items():
+            row = self._compute_features(ip, window, group_events)
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame(columns=['source_ip', 'window_start'] + self.FEATURE_NAMES)
+
+        df = pd.DataFrame(rows)
+        return df
+
+    def _compute_features(self, ip: str, window: datetime, events: List[AuthEvent]) -> Dict:
+        failed = [e for e in events if e.event_type == 'failed_login']
+        accepted = [e for e in events if e.event_type == 'accepted_login']
+        invalid = [e for e in events if e.event_type == 'invalid_user']
+        sudo = [e for e in events if e.event_type == 'sudo_command']
+
+        usernames = set(e.user for e in events if e.user)
+        target_users = set(e.target_user for e in sudo if e.target_user)
+        ports = set(e.port for e in events if e.port)
+
+        timestamps = [e.timestamp for e in events if e.timestamp]
+        time_span = (max(timestamps) - min(timestamps)).total_seconds() if len(timestamps) > 1 else 0.0
+        minutes_span = max(time_span / 60.0, 1.0)
+
+        night_events = sum(1 for t in timestamps if 0 <= t.hour < 6)
+        night_frac = night_events / len(timestamps) if timestamps else 0.0
+
+        n_failed = len(failed)
+        n_accepted = len(accepted)
+        ratio = n_failed / (n_accepted + 1)  # +1 avoids div by zero, smooths small samples
+
+        return {
+            'source_ip': ip,
+            'window_start': window,
+            'failed_login_count': n_failed,
+            'accepted_login_count': n_accepted,
+            'invalid_user_count': len(invalid),
+            'distinct_usernames_tried': len(usernames),
+            'sudo_command_count': len(sudo),
+            'distinct_target_users': len(target_users),
+            'failure_to_success_ratio': ratio,
+            'time_span_seconds': time_span,
+            'events_per_minute': len(events) / minutes_span,
+            'night_time_activity': night_frac,
+            'unique_ports_used': len(ports),
+            'event_count': len(events),
+            'sample_events': events[:5],  # keep a few raw events for narration later
+        }
+
+    def feature_matrix(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract just the numeric feature columns as a numpy array for sklearn."""
+        return df[self.FEATURE_NAMES].fillna(0).values
