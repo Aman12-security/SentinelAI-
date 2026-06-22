@@ -1,0 +1,31 @@
+# 🛡️ Security Policy — SentinelAI
+
+## Reporting a Vulnerability
+
+If you discover a security vulnerability in SentinelAI, please open a private
+security advisory on GitHub (Repository → Security → Advisories → New draft
+security advisory) rather than a public issue.
+
+Please include:
+- A description of the vulnerability
+- Steps to reproduce
+- Potential impact
+
+We aim to respond within 5 business days.
+
+---
+
+## Scope & Data Handling
+
+- SentinelAI reads log files **locally only**. No log file contents are uploaded anywhere by default.
+- When LLM narration is enabled (`ANTHROPIC_API_KEY` set), only **aggregated behavioral statistics** (counts, rates, the source IP under review) are sent to the Anthropic API for narration — not raw log lines.
+- Running with `--no-llm` guarantees zero external network calls.
+- Never commit real production `.log` files to version control — `.gitignore` is configured to help prevent this, but always double-check with `git status` before committing.
+
+---
+
+## Known Limitations
+
+- This tool is intended for **defensive security monitoring and education**. It is not a replacement for a full SIEM/EDR solution in production environments.
+- Isolation Forest contamination parameter requires tuning per environment — default `0.1` is a starting point, not a guarantee against false negatives/positives.
+- The bundled offline narration templates are deliberately simple pattern-matches; for nuanced or novel attack patterns, LLM narration (or human analyst review) will provide better context.
