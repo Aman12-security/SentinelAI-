@@ -1,0 +1,170 @@
+# 📦 INSTALL.md — SentinelAI Installation Guide
+
+> Complete installation instructions for Windows, Linux, and macOS.
+
+---
+
+## ✅ System Requirements
+
+| Requirement | Minimum | Recommended |
+|---|---|---|
+| **Python** | 3.10 | 3.11+ |
+| **RAM** | 256 MB | 512 MB |
+| **Storage** | 100 MB | 200 MB |
+| **OS** | Windows 10 / Ubuntu 20.04 / macOS 11 | Latest |
+| **Internet** | Optional (only for LLM narration) | Stable broadband |
+
+---
+
+## 🔽 Step 1 — Download the Project
+
+**Option A — Using Git (Recommended)**
+```bash
+git clone https://github.com/YOUR_USERNAME/SentinelAI.git
+cd SentinelAI
+```
+
+**Option B — Download ZIP**
+1. Go to the GitHub repo page
+2. Click **Code** → **Download ZIP**
+3. Extract the ZIP
+4. Open a terminal inside the extracted folder
+
+---
+
+## 🐍 Step 2 — Install Python
+
+### Windows
+1. Go to https://python.org/downloads
+2. Download Python 3.11+ installer
+3. **✅ Check "Add Python to PATH"** during install
+4. Verify: open Command Prompt → `python --version`
+
+### Linux (Ubuntu/Debian)
+```bash
+sudo apt update
+sudo apt install python3 python3-pip python3-venv -y
+python3 --version
+```
+
+### macOS
+```bash
+brew install python3
+python3 --version
+```
+
+---
+
+## 🧪 Step 3 — Create a Virtual Environment (Recommended)
+
+### Windows
+```cmd
+python -m venv venv
+venv\Scripts\activate
+```
+
+### Linux / macOS
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+To deactivate later: `deactivate`
+
+---
+
+## 📦 Step 4 — Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs:
+- `scikit-learn` — Isolation Forest ML model
+- `pandas` / `numpy` — feature engineering
+- `anthropic` — Claude API client (for LLM narration)
+- `python-dotenv` — load `.env` configuration
+- `pytest` — testing framework
+
+Verify installation:
+```bash
+pip list | grep -E "scikit-learn|pandas|anthropic"
+```
+
+---
+
+## 🔑 Step 5 — (Optional) Configure LLM Narration
+
+SentinelAI works **fully offline** without this step — it uses rule-based
+templates to explain findings. Set this up only if you want Claude-generated
+natural-language explanations.
+
+```bash
+# Linux/macOS
+cp .env.example .env
+
+# Windows
+copy .env.example .env
+```
+
+Get an API key from **https://console.anthropic.com/** and paste it into `.env`:
+```env
+ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+> ⚠️ **Never commit your `.env` file or share your API key.**
+
+---
+
+## ▶️ Step 6 — Run SentinelAI
+
+### Quick Test (bundled sample log, offline mode)
+```bash
+python src/sentinel.py --log sample_logs/sample_auth.log --no-llm
+```
+
+If you see a threat report with risk scores — everything works! ✅
+
+### Run Unit Tests
+```bash
+python -m pytest tests/ -v
+```
+Expected: `31 passed`
+
+### Analyze a Real System Log
+
+**Linux:**
+```bash
+sudo python src/sentinel.py --log /var/log/auth.log
+```
+*(sudo is needed because `/var/log/auth.log` is typically root-readable only)*
+
+**With LLM narration enabled** (after Step 5):
+```bash
+python src/sentinel.py --log /var/log/auth.log
+```
+
+---
+
+## 🛑 Troubleshooting
+
+| Problem | Cause | Solution |
+|---|---|---|
+| `python: command not found` | Python not installed or not in PATH | Reinstall Python, check "Add to PATH" |
+| `No module named 'sklearn'` | Dependencies not installed | `pip install -r requirements.txt` |
+| `No module named 'anthropic'` | Missing package | `pip install anthropic` |
+| `Permission denied: /var/log/auth.log` | Insufficient permissions | Run with `sudo` on Linux |
+| `Cannot fit on empty feature set` | Log file has no parseable lines | Check log format matches standard syslog |
+| LLM narration not working | No API key set | Either set `ANTHROPIC_API_KEY` in `.env`, or use `--no-llm` |
+| `FileNotFoundError` for log file | Wrong path | Use absolute path or check working directory |
+
+---
+
+## ✅ Installation Checklist
+
+- [ ] Python 3.10+ installed (`python --version`)
+- [ ] Virtual environment created and activated
+- [ ] `pip install -r requirements.txt` completed without errors
+- [ ] `python src/sentinel.py --log sample_logs/sample_auth.log --no-llm` runs successfully
+- [ ] `python -m pytest tests/ -v` shows `31 passed`
+- [ ] (Optional) `.env` configured with `ANTHROPIC_API_KEY` for LLM narration
