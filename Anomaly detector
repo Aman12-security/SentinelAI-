@@ -1,0 +1,118 @@
+"""
+SentinelAI Anomaly Detector
+Uses Isolation Forest (unsupervised ML) to detect anomalous authentication
+behavior — brute force attempts, credential stuffing, privilege escalation
+patterns — WITHOUT needing labeled attack data.
+
+Why Isolation Forest?
+- Unsupervised: no need for pre-labeled "this was an attack" training data
+- Fast: O(n log n), scales to large log files
+- Built for outliers: isolates anomalies by random partitioning — anomalies
+  need fewer splits to isolate than normal points
+- Works well on tabular behavioral features (exactly what we built)
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from typing import Dict, List, Tuple
+
+from feature_builder import FeatureBuilder
+
+
+class AnomalyDetector:
+    """
+    Wraps an Isolation Forest model with preprocessing and a convenience
+    API for scoring auth log behavioral windows.
+    """
+
+    def __init__(self, contamination: float = 0.1, random_state: int = 42, n_estimators: int = 200):
+        """
+        contamination: expected proportion of anomalies in the data (0.1 = 10%).
+                        Tune this based on how noisy/attacked your environment is.
+        """
+        self.contamination = contamination
+        self.model = IsolationForest(
+            n_estimators=n_estimators,
+            contamination=contamination,
+            random_state=random_state,
+            n_jobs=-1
+        )
+        self.scaler = StandardScaler()
+        self.feature_builder = FeatureBuilder()
+        self.is_fitted = False
+
+    def fit(self, feature_df: pd.DataFrame):
+        """Train the Isolation Forest on behavioral feature windows."""
+        if feature_df.empty:
+            raise ValueError("Cannot fit on empty feature set — no parseable events found.")
+
+        X = self.feature_builder.feature_matrix(feature_df)
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled)
+        self.is_fitted = True
+        return self
+
+    def score(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Score each behavioral window. Adds columns:
+          - anomaly_score: raw IsolationForest decision_function output
+                            (lower = more anomalous)
+          - is_anomaly: boolean flag (1 = anomaly, 0 = normal)
+          - risk_score: 0-100 normalized score (100 = most suspicious)
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Model must be fit() before scoring.")
+        if feature_df.empty:
+            return feature_df
+
+        X = self.feature_builder.feature_matrix(feature_df)
+        X_scaled = self.scaler.transform(X)
+
+        raw_scores = self.model.decision_function(X_scaled)   # higher = more normal
+        predictions = self.model.predict(X_scaled)              # -1 = anomaly, 1 = normal
+
+        # Normalize raw_scores to a 0-100 risk score (invert: lower raw = higher risk)
+        min_s, max_s = raw_scores.min(), raw_scores.max()
+        span = max(max_s - min_s, 1e-9)
+        risk_scores = 100 * (1 - (raw_scores - min_s) / span)
+
+        result = feature_df.copy()
+        result['anomaly_score'] = raw_scores
+        result['is_anomaly'] = (predictions == -1)
+        result['risk_score'] = risk_scores.round(1)
+
+        return result.sort_values('risk_score', ascending=False)
+
+    def fit_predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """Convenience: fit and score in one call (for single-batch analysis)."""
+        self.fit(feature_df)
+        return self.score(feature_df)
+
+    def explain_features(self, row: pd.Series) -> List[Tuple[str, float, str]]:
+        """
+        Return a human-readable breakdown of which features drove this row's
+        anomaly score, ranked by deviation from the dataset mean.
+        Used by the LLM narrator to ground its explanation in real numbers.
+        """
+        explanations = []
+        feature_descriptions = {
+            'failed_login_count': 'failed login attempts',
+            'accepted_login_count': 'successful logins',
+            'invalid_user_count': 'logins to non-existent usernames',
+            'distinct_usernames_tried': 'distinct usernames attempted',
+            'sudo_command_count': 'sudo commands executed',
+            'distinct_target_users': 'distinct privilege-escalation targets',
+            'failure_to_success_ratio': 'failure-to-success ratio',
+            'events_per_minute': 'events per minute (request rate)',
+            'night_time_activity': 'fraction of activity during 12am-6am',
+            'unique_ports_used': 'distinct source ports used',
+        }
+        for feat in self.feature_builder.FEATURE_NAMES:
+            if feat in row and feat in feature_descriptions:
+                val = row[feat]
+                if isinstance(val, (int, float)) and val > 0:
+                    explanations.append((feat, float(val), feature_descriptions[feat]))
+        explanations.sort(key=lambda x: x[1], reverse=True)
+        return explanations[:6]
