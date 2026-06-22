@@ -1,0 +1,161 @@
+"""
+SentinelAI LLM Narrator
+Takes structured ML anomaly findings (from Isolation Forest) and asks an
+LLM (Claude) to explain them in plain English for a SOC analyst —
+translating numbers into a readable security narrative.
+
+Design principle: the LLM NEVER decides what's anomalous — that's the ML
+model's job (deterministic, auditable). The LLM only explains WHY the
+already-flagged behavior looks suspicious, in human terms. This keeps the
+detection logic transparent and not dependent on LLM judgment calls.
+"""
+
+import os
+import json
+from typing import Dict, List, Optional
+import pandas as pd
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+
+class LLMNarrator:
+    """
+    Wraps the Anthropic API to generate plain-English explanations of
+    anomalous authentication behavior detected by the ML model.
+
+    Falls back to a template-based explanation if no API key is set,
+    so the tool remains fully functional offline / without API costs.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-5-20250929"):
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.model = model
+        self.client = None
+
+        if ANTHROPIC_AVAILABLE and self.api_key:
+            self.client = anthropic.Anthropic(api_key=self.api_key)
+
+    @property
+    def llm_enabled(self) -> bool:
+        return self.client is not None
+
+    def narrate_finding(self, row: pd.Series, explanations: List[tuple]) -> str:
+        """
+        Generate a plain-English explanation for a single anomalous window.
+        Uses Claude if available, otherwise falls back to a template.
+        """
+        if self.llm_enabled:
+            try:
+                return self._narrate_with_llm(row, explanations)
+            except Exception as e:
+                return self._narrate_with_template(row, explanations) + \
+                    f"\n\n_(LLM narration unavailable: {e})_"
+        return self._narrate_with_template(row, explanations)
+
+    def _build_prompt(self, row: pd.Series, explanations: List[tuple]) -> str:
+        feature_lines = "\n".join(
+            f"  - {desc}: {val:.1f}" for _, val, desc in explanations
+        )
+        return f"""You are a SOC (Security Operations Center) analyst assistant. An Isolation \
+Forest machine learning model flagged the following authentication activity as anomalous. \
+Explain in 2-4 plain-English sentences WHY this looks suspicious, what the likely attack \
+pattern is (e.g. brute force, credential stuffing, account enumeration, privilege escalation), \
+and a one-line recommended action. Be concise, factual, and avoid hedging. Do not invent \
+details not present in the data.
+
+Source IP / actor: {row.get('source_ip', 'unknown')}
+Time window start: {row.get('window_start', 'unknown')}
+Risk score (0-100, ML-derived): {row.get('risk_score', 0):.1f}
+
+Behavioral metrics that drove this score:
+{feature_lines}
+
+Respond in this exact format:
+SUMMARY: <one sentence what happened>
+LIKELY ATTACK PATTERN: <name the pattern>
+RECOMMENDED ACTION: <one concrete action>"""
+
+    def _narrate_with_llm(self, row: pd.Series, explanations: List[tuple]) -> str:
+        prompt = self._build_prompt(row, explanations)
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+
+    def _narrate_with_template(self, row: pd.Series, explanations: List[tuple]) -> str:
+        """
+        Rule-based fallback narration — used when no ANTHROPIC_API_KEY is set.
+        Ensures the tool is 100% functional without any API cost or key.
+        """
+        ip = row.get('source_ip', 'unknown source')
+        risk = row.get('risk_score', 0)
+        failed = row.get('failed_login_count', 0)
+        invalid = row.get('invalid_user_count', 0)
+        distinct_users = row.get('distinct_usernames_tried', 0)
+        sudo_count = row.get('sudo_command_count', 0)
+        ratio = row.get('failure_to_success_ratio', 0)
+        rate = row.get('events_per_minute', 0)
+        night = row.get('night_time_activity', 0)
+
+        pattern = "Unusual authentication behavior"
+        action = "Review logs manually for this IP/user and consider monitoring."
+
+        if failed >= 5 and distinct_users <= 2:
+            pattern = "Brute-force attack against a small set of accounts"
+            action = f"Block source IP {ip} at the firewall and force password reset on targeted account(s)."
+        elif invalid >= 3 and distinct_users >= 3:
+            pattern = "Account enumeration / credential stuffing"
+            action = f"Rate-limit or block {ip}; verify no usernames leaked from this list match real accounts."
+        elif sudo_count >= 3 and row.get('distinct_target_users', 0) >= 2:
+            pattern = "Suspicious privilege escalation attempts"
+            action = "Audit sudoers configuration and review the user's recent command history immediately."
+        elif rate > 10:
+            pattern = "High-frequency automated login attempts (scripted attack)"
+            action = f"Apply fail2ban / rate-limiting rules for {ip}."
+        elif night > 0.7:
+            pattern = "Off-hours authentication activity (possible compromised credentials)"
+            action = "Confirm with the account owner whether this access was authorized."
+
+        summary = (
+            f"Source {ip} triggered a risk score of {risk:.0f}/100 with "
+            f"{int(failed)} failed login(s), {int(invalid)} invalid-user attempt(s), "
+            f"and {int(distinct_users)} distinct username(s) tried, at a rate of "
+            f"{rate:.1f} events/minute."
+        )
+
+        return (
+            f"SUMMARY: {summary}\n"
+            f"LIKELY ATTACK PATTERN: {pattern}\n"
+            f"RECOMMENDED ACTION: {action}"
+        )
+
+    def narrate_report(self, scored_df: pd.DataFrame, detector, top_n: int = 10) -> str:
+        """
+        Generate a full narrated report for the top N most anomalous windows.
+        """
+        anomalies = scored_df[scored_df['is_anomaly']].head(top_n)
+        if anomalies.empty:
+            return "✅ No anomalous authentication behavior detected in this log window."
+
+        sections = []
+        sections.append(f"🚨 {len(anomalies)} anomalous behavior window(s) detected\n" + "=" * 60)
+
+        for i, (_, row) in enumerate(anomalies.iterrows(), 1):
+            explanations = detector.explain_features(row)
+            narration = self.narrate_finding(row, explanations)
+            sections.append(
+                f"\n[{i}] Source: {row.get('source_ip')} | "
+                f"Window: {row.get('window_start')} | Risk: {row.get('risk_score'):.0f}/100\n"
+                f"{'-' * 60}\n{narration}"
+            )
+
+        engine_note = "LLM-narrated (Claude)" if self.llm_enabled else "Template-narrated (offline mode — set ANTHROPIC_API_KEY for LLM narration)"
+        sections.append(f"\n{'=' * 60}\nNarration engine: {engine_note}")
+
+        return "\n".join(sections)
