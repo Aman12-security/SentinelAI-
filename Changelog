@@ -1,0 +1,20 @@
+# Changelog
+
+All notable changes to SentinelAI are documented here.
+
+## [1.0.0] — 2026-06-20
+
+### Added
+- Initial release of SentinelAI
+- Regex-based auth.log parser supporting SSH (failed/accepted login, invalid user, disconnect), sudo commands, and PAM session events
+- Behavioral feature engineering: 11 features aggregated per source IP / 10-minute time window
+- Isolation Forest unsupervised anomaly detection with tunable contamination parameter
+- Claude LLM narration of flagged anomalies, with full offline rule-based fallback
+- CLI tool (`src/sentinel.py`) with configurable window size, contamination, top-N reporting, and JSON export
+- Sample auth.log with 3 embedded attack patterns (brute force, account enumeration, privilege escalation/backdoor creation) for instant demo
+- 31 unit and integration tests covering parser, feature builder, detector, and narrator
+- Full documentation: README, INSTALL, HOW_IT_WORKS, TOOLS_AND_TECHNIQUES, GitHub upload guide
+
+### Design Decisions
+- LLM is used only for narration/explanation, never for the anomaly detection decision itself — keeps detection deterministic and auditable
+- Offline-first: tool is 100% functional without any API key or internet connection
