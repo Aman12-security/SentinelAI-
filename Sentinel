@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+SentinelAI — AI-Powered Linux Auth Log Threat Detector
+=======================================================
+CLI tool combining:
+  - Unsupervised ML (Isolation Forest) to DETECT anomalous auth behavior
+  - LLM narration (Claude) to EXPLAIN findings in plain English
+
+Usage:
+    python src/sentinel.py --log /var/log/auth.log
+    python src/sentinel.py --log sample_logs/sample_auth.log --top 5
+    python src/sentinel.py --log sample_logs/sample_auth.log --contamination 0.15
+    python src/sentinel.py --log sample_logs/sample_auth.log --json report.json
+    python src/sentinel.py --log sample_logs/sample_auth.log --no-llm
+"""
+
+import argparse
+import sys
+import os
+import json
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from log_parser import AuthLogParser
+from feature_builder import FeatureBuilder
+from anomaly_detector import AnomalyDetector
+from llm_narrator import LLMNarrator
+
+
+BANNER = r"""
+   _____           __  _            _    _____
+  / ____|         / / (_)          | |  / ____|
+ | (___   ___ ___/ /_  _ _ __   ___| | | |  __  ___ _ __
+  \___ \ / _ Y __| __|| | '_ \ / _ \ | | | |_ |/ _ Y '_ \
+  ____) |  __|\__ \ |_ | | | | |  __/ |_| |__| |  __/ | | |
+ |_____/ \___||___/\__||_|_| |_|\___|\___/\_____|\___|_| |_|
+
+   AI-Powered Linux Auth Log Threat Detector
+   ML Detection (Isolation Forest) + LLM Narration (Claude)
+"""
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="SentinelAI — detect & explain anomalous Linux auth log activity",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument('--log', '-l', required=True, help='Path to auth.log file to analyze')
+    p.add_argument('--top', '-n', type=int, default=10, help='Number of top anomalies to report (default: 10)')
+    p.add_argument('--contamination', '-c', type=float, default=0.1,
+                   help='Expected fraction of anomalous behavior, 0.0-0.5 (default: 0.1)')
+    p.add_argument('--window', '-w', type=int, default=10,
+                   help='Time window in minutes for behavioral aggregation (default: 10)')
+    p.add_argument('--json', '-j', metavar='FILE', help='Write full structured results to this JSON file')
+    p.add_argument('--no-llm', action='store_true', help='Disable LLM narration, use offline template explanations only')
+    p.add_argument('--no-banner', action='store_true', help='Suppress ASCII banner')
+    p.add_argument('--year', type=int, default=None, help='Year to assume for log timestamps (default: current year)')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not args.no_banner:
+        print(BANNER)
+
+    log_path = Path(args.log)
+    if not log_path.exists():
+        print(f"❌ Error: log file not found: {log_path}")
+        sys.exit(1)
+
+    print(f"📂 Parsing log file: {log_path}")
+    parser = AuthLogParser(default_year=args.year)
+    events = parser.parse_file(str(log_path))
+    print(f"   → {len(events)} log lines parsed into structured events")
+
+    if not events:
+        print("⚠️  No parseable auth events found. Is this a standard syslog-format auth.log?")
+        sys.exit(1)
+
+    print(f"\n🔧 Building behavioral features (window = {args.window} min)...")
+    builder = FeatureBuilder(window_minutes=args.window)
+    feature_df = builder.build(events)
+    print(f"   → {len(feature_df)} behavioral windows constructed (per source IP / time window)")
+
+    if feature_df.empty:
+        print("⚠️  No timestamped events available to build features. Exiting.")
+        sys.exit(1)
+
+    print(f"\n🤖 Running Isolation Forest anomaly detection (contamination={args.contamination})...")
+    detector = AnomalyDetector(contamination=args.contamination)
+    scored_df = detector.fit_predict(feature_df)
+
+    n_anomalies = int(scored_df['is_anomaly'].sum())
+    print(f"   → {n_anomalies} anomalous window(s) flagged out of {len(scored_df)} total")
+
+    print(f"\n🧠 Generating plain-English narration", end="")
+    api_key = None if args.no_llm else os.getenv("ANTHROPIC_API_KEY")
+    narrator = LLMNarrator(api_key=api_key)
+    print(f" ({'Claude LLM' if narrator.llm_enabled else 'offline template mode'})...")
+
+    report = narrator.narrate_report(scored_df, detector, top_n=args.top)
+
+    print("\n" + "=" * 70)
+    print("  SENTINELAI THREAT REPORT")
+    print("=" * 70)
+    print(report)
+    print("=" * 70)
+
+    # Summary table
+    print(f"\n📊 Top {min(args.top, len(scored_df))} riskiest behavioral windows:\n")
+    display_cols = ['source_ip', 'window_start', 'risk_score', 'failed_login_count',
+                     'invalid_user_count', 'distinct_usernames_tried', 'sudo_command_count']
+    top_rows = scored_df.head(args.top)[display_cols]
+    try:
+        print(top_rows.to_string(index=False))
+    except Exception:
+        print(top_rows)
+
+    if args.json:
+        export_data = {
+            'summary': {
+                'total_events_parsed': len(events),
+                'total_windows': len(scored_df),
+                'anomalous_windows': n_anomalies,
+                'contamination_setting': args.contamination,
+                'llm_narration_used': narrator.llm_enabled,
+            },
+            'windows': json.loads(
+                scored_df.drop(columns=['sample_events'], errors='ignore').to_json(orient='records')
+            )
+        }
+        with open(args.json, 'w') as f:
+            json.dump(export_data, f, indent=2, default=str)
+        print(f"\n💾 Full results written to: {args.json}")
+
+    print(f"\n✅ Analysis complete. {n_anomalies} window(s) flagged for review.\n")
+
+
+if __name__ == "__main__":
+    main()
